@@ -1,0 +1,263 @@
+"""
+API MARWIN — Nuvem (Opção B)
+============================
+API mínima para o index.html gravar no Neon sem o PC da escola ligado.
+
+Deploy (ex.: Render, Railway):
+  pip install flask flask-cors psycopg2-binary gunicorn
+  gunicorn ApiNuvem:app --bind 0.0.0.0:$PORT
+
+Variáveis de ambiente:
+  MARWIN_DATABASE_URL  — connection string do Neon
+  MARWIN_ADMIN_PASS      — senha para rotas /admin/* (sync do painel local)
+  PORT                   — porta (padrão 8080)
+"""
+
+import os
+import sys
+import subprocess
+import logging
+import datetime
+
+for pkg in ["flask", "flask-cors", "psycopg2-binary"]:
+    try:
+        __import__(pkg.replace("-", "_"))
+    except ImportError:
+        subprocess.check_call([sys.executable, "-m", "pip", "install", pkg, "--quiet"])
+
+from flask import Flask, request, jsonify
+from flask_cors import CORS
+import secrets
+
+import marwin_db as db
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+logger = logging.getLogger("marwin.api")
+
+app = Flask(__name__)
+CORS(app)
+
+ADMIN_PASSWORD = os.getenv("MARWIN_ADMIN_PASS", "Marwin2026")
+
+try:
+    import bcrypt
+    BCRYPT_AVAILABLE = True
+except Exception:
+    BCRYPT_AVAILABLE = False
+
+
+def checar_senha(req):
+    hdr = req.headers.get("X-Senha", "")
+    if not hdr:
+        return False
+    if BCRYPT_AVAILABLE and isinstance(ADMIN_PASSWORD, str) and ADMIN_PASSWORD.startswith("$2"):
+        try:
+            return bcrypt.checkpw(hdr.encode("utf-8"), ADMIN_PASSWORD.encode("utf-8"))
+        except Exception:
+            return False
+    return secrets.compare_digest(hdr, ADMIN_PASSWORD)
+
+
+@app.route("/health", methods=["GET"])
+def health():
+    return jsonify({"status": "ok", "servico": "marwin-api"})
+
+
+@app.route("/cardapio", methods=["GET"])
+def get_cardapio():
+    return jsonify(db.ler_config_kv("cardapio", db.CARDAPIO_PADRAO))
+
+
+@app.route("/eventos", methods=["GET"])
+def get_eventos():
+    return jsonify(db.ler_config_kv("eventos", db.EVENTOS_PADRAO))
+
+
+@app.route("/config", methods=["GET"])
+def get_config():
+    return jsonify(db.ler_config_kv("config", db.CONFIG_PADRAO))
+
+
+@app.route("/admin/cardapio", methods=["PUT"])
+def put_cardapio():
+    if not checar_senha(request):
+        return jsonify({"erro": "Acesso negado"}), 403
+    dados = request.get_json()
+    if dados is None:
+        return jsonify({"erro": "JSON invalido"}), 400
+    try:
+        db.salvar_config_kv("cardapio", dados)
+        return jsonify({"status": "ok"})
+    except Exception as e:
+        logger.error(f"Erro ao salvar cardapio: {e}")
+        return jsonify({"erro": str(e)}), 500
+
+
+@app.route("/admin/eventos", methods=["PUT"])
+def put_eventos():
+    if not checar_senha(request):
+        return jsonify({"erro": "Acesso negado"}), 403
+    dados = request.get_json()
+    if not isinstance(dados, list):
+        return jsonify({"erro": "Lista de eventos esperada"}), 400
+    try:
+        db.salvar_config_kv("eventos", dados)
+        return jsonify({"status": "ok"})
+    except Exception as e:
+        logger.error(f"Erro ao salvar eventos: {e}")
+        return jsonify({"erro": str(e)}), 500
+
+
+@app.route("/admin/config", methods=["PUT"])
+def put_config():
+    if not checar_senha(request):
+        return jsonify({"erro": "Acesso negado"}), 403
+    dados = request.get_json()
+    if dados is None:
+        return jsonify({"erro": "JSON invalido"}), 400
+    try:
+        db.salvar_config_kv("config", dados)
+        return jsonify({"status": "ok"})
+    except Exception as e:
+        logger.error(f"Erro ao salvar config: {e}")
+        return jsonify({"erro": str(e)}), 500
+
+
+@app.route("/avaliacao/verificar", methods=["GET"])
+def verificar_avaliacao():
+    nome = request.args.get("nome", "").strip()
+    if not nome or nome.lower() in {"anonimo", "anônimo"}:
+        return jsonify({"ja_avaliou": False}), 200
+    hoje = datetime.date.today()
+    try:
+        ja = db.avaliacao_ja_existe_db(nome, hoje.isocalendar()[1], hoje.isocalendar()[0])
+        return jsonify({"ja_avaliou": ja}), 200
+    except RuntimeError:
+        return jsonify({"erro": "Banco de dados indisponível"}), 503
+
+
+@app.route("/avaliacao", methods=["POST"])
+def post_avaliacao():
+    dados = request.get_json()
+    if not dados:
+        return jsonify({"erro": "JSON invalido"}), 400
+    nome = dados.get("nome", "Anonimo")
+    serie = dados.get("serie", "N/A")
+    curso = dados.get("curso", "N/A")
+    respostas = dados.get("respostas", {})
+
+    if nome and nome.strip().lower() not in {"anonimo", "anônimo"}:
+        hoje = datetime.date.today()
+        try:
+            if db.avaliacao_ja_existe_db(nome, hoje.isocalendar()[1], hoje.isocalendar()[0]):
+                return jsonify({"status": "ja_avaliou", "mensagem": "Você já avaliou esta semana"}), 200
+        except RuntimeError:
+            return jsonify({"erro": "Banco de dados indisponível"}), 503
+
+    data_hora = datetime.datetime.now().strftime("%d/%m/%Y %H:%M:%S")
+    try:
+        for chave, nota in respostas.items():
+            estagio, item = chave.split("|", 1)
+            db.inserir_avaliacao_db([data_hora, nome, serie, curso, estagio, item, nota])
+    except RuntimeError:
+        return jsonify({"erro": "Banco de dados indisponível"}), 503
+    except Exception as e:
+        logger.error(f"Erro ao salvar avaliação: {e}")
+        return jsonify({"erro": "Erro ao salvar avaliação"}), 500
+    logger.info(f"Avaliação: {nome} ({len(respostas)} itens)")
+    return jsonify({"status": "ok"})
+
+
+@app.route("/refeitorio/registrar", methods=["POST"])
+def registrar_refeicao():
+    dados = request.get_json()
+    if not dados:
+        return jsonify({"erro": "JSON invalido"}), 400
+
+    matricula = db.limpar_campo_usb(dados.get("matricula", "").strip())
+    refeicao = dados.get("refeicao", "almoco").strip().lower()
+    nome = db.limpar_campo_usb(dados.get("nome", "Desconhecido").strip()) or "Desconhecido"
+    serie = db.limpar_campo_usb(dados.get("serie", "N/A").strip()) or "N/A"
+    curso = db.limpar_campo_usb(dados.get("curso", "N/A").strip()) or "N/A"
+
+    if not matricula:
+        return jsonify({"erro": "Matricula nao informada"}), 400
+
+    dup = db.refeitorio_duplicado_db(matricula, refeicao)
+    if dup:
+        return jsonify({
+            "status": "ja_registrado",
+            "nome": dup["nome"],
+            "hora": dup["hora"],
+            "total_hoje": dup["total_hoje"],
+            "total_refeicao": dup["total_refeicao"],
+        }), 200
+
+    hora = datetime.datetime.now().strftime("%H:%M:%S")
+    registro = [db.hoje(), hora, matricula, nome, serie, curso, refeicao]
+    try:
+        db.inserir_refeitorio_db(registro)
+    except RuntimeError:
+        return jsonify({"erro": "Banco de dados indisponível"}), 503
+
+    registros = db.ler_refeitorio_hoje_db()
+    total_refeicao = sum(1 for r in registros if r[6] == refeicao)
+    return jsonify({
+        "status": "ok",
+        "nome": nome,
+        "hora": hora,
+        "aula": db.aula_por_hora(hora),
+        "total_hoje": len(registros),
+        "total_refeicao": total_refeicao,
+    }), 200
+
+
+@app.route("/frequencia/registrar", methods=["POST"])
+def registrar_frequencia():
+    dados = request.get_json()
+    if not dados:
+        return jsonify({"erro": "JSON invalido"}), 400
+
+    matricula = db.limpar_campo_usb(dados.get("matricula", "").strip())
+    nome = db.limpar_campo_usb(dados.get("nome", "Desconhecido").strip()) or "Desconhecido"
+    serie = db.limpar_campo_usb(dados.get("serie", "N/A").strip()) or "N/A"
+    curso = db.limpar_campo_usb(dados.get("curso", "N/A").strip()) or "N/A"
+
+    if not matricula:
+        return jsonify({"erro": "Matricula nao informada"}), 400
+
+    dup = db.frequencia_duplicado_db(matricula)
+    if dup:
+        return jsonify({
+            "status": "ja_registrado",
+            "nome": dup["nome"],
+            "hora": dup["hora"],
+            "total_hoje": dup["total_hoje"],
+        }), 200
+
+    hora = datetime.datetime.now().strftime("%H:%M:%S")
+    registro = [db.hoje(), hora, matricula, nome, serie, curso, db.aula_por_hora(hora)]
+    try:
+        db.inserir_frequencia_db(registro)
+    except RuntimeError:
+        return jsonify({"erro": "Banco de dados indisponível"}), 503
+
+    registros = db.ler_frequencia_hoje_db()
+    return jsonify({
+        "status": "ok",
+        "nome": nome,
+        "hora": hora,
+        "aula": registro[6],
+        "total_hoje": len(registros),
+    }), 200
+
+
+if __name__ == "__main__":
+    db.iniciar_pool_pg()
+    try:
+        db.criar_tabelas()
+    except Exception as e:
+        logger.warning(f"Tabelas: {e}")
+    port = int(os.getenv("PORT", "8080"))
+    logger.info(f"API MARWIN na porta {port}")
+    app.run(host="0.0.0.0", port=port, debug=False)
