@@ -39,6 +39,13 @@ CORS(app)
 
 ADMIN_PASSWORD = os.getenv("MARWIN_ADMIN_PASS", "Marwin2026")
 
+# Timestamp do último dado inserido — usado pelo polling do index.html
+_ultimo_update_ts = None
+
+@app.route("/ultimo-update", methods=["GET"])
+def ultimo_update():
+    return jsonify({"ts": _ultimo_update_ts})
+
 try:
     import bcrypt
     BCRYPT_AVAILABLE = True
@@ -164,6 +171,8 @@ def post_avaliacao():
     except Exception as e:
         logger.error(f"Erro ao salvar avaliação: {e}")
         return jsonify({"erro": "Erro ao salvar avaliação"}), 500
+    global _ultimo_update_ts
+    _ultimo_update_ts = datetime.datetime.now().isoformat()
     logger.info(f"Avaliação: {nome} ({len(respostas)} itens)")
     return jsonify({"status": "ok"})
 
@@ -200,6 +209,8 @@ def registrar_refeicao():
     except RuntimeError:
         return jsonify({"erro": "Banco de dados indisponível"}), 503
 
+    global _ultimo_update_ts
+    _ultimo_update_ts = datetime.datetime.now().isoformat()
     registros = db.ler_refeitorio_hoje_db()
     total_refeicao = sum(1 for r in registros if r[6] == refeicao)
     return jsonify({
@@ -242,6 +253,8 @@ def registrar_frequencia():
     except RuntimeError:
         return jsonify({"erro": "Banco de dados indisponível"}), 503
 
+    global _ultimo_update_ts
+    _ultimo_update_ts = datetime.datetime.now().isoformat()
     registros = db.ler_frequencia_hoje_db()
     return jsonify({
         "status": "ok",
@@ -261,3 +274,9 @@ if __name__ == "__main__":
     port = int(os.getenv("PORT", "8080"))
     logger.info(f"API MARWIN na porta {port}")
     app.run(host="0.0.0.0", port=port, debug=False)
+    
+@app.route("/rotas", methods=["GET"])
+def listar_rotas():
+    return jsonify(
+        sorted([str(r) for r in app.url_map.iter_rules()])
+    )
