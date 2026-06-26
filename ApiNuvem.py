@@ -19,7 +19,7 @@ import subprocess
 import logging
 import datetime
 
-for pkg in ["flask", "flask-cors", "psycopg2-binary"]:
+for pkg in ["flask", "flask-cors", "psycopg2-binary", "flask-sock"]:
     try:
         __import__(pkg.replace("-", "_"))
     except ImportError:
@@ -30,6 +30,10 @@ from flask_cors import CORS
 import secrets
 
 import marwin_db as db
+from flask_sock import Sock
+
+sock = Sock(app)
+_ws_clientes_refeitorio = set()   # clientes WebSocket conectados ao painel TV
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("marwin.api")
@@ -218,6 +222,7 @@ def registrar_refeicao():
 
     global _ultimo_update_ts
     _ultimo_update_ts = datetime.datetime.now().isoformat()
+    _broadcast_refeitorio()
     registros = db.ler_refeitorio_hoje_db()
     total_refeicao = sum(1 for r in registros if r[6] == refeicao)
     return jsonify({
@@ -270,6 +275,75 @@ def registrar_frequencia():
         "aula": registro[6],
         "total_hoje": len(registros),
     }), 200
+
+
+def _total_alunos():
+    """Retorna o total de alunos cadastrados para calcular ausências no TV."""
+    try:
+        lista = db.ler_config_kv("lista_alunos", [])
+        if isinstance(lista, list) and len(lista) > 0:
+            return len(lista)
+    except Exception:
+        pass
+    return None
+
+
+def _payload_refeitorio():
+    """Monta o JSON que o tv.html espera."""
+    registros = db.ler_refeitorio_hoje_db()
+    matriculas_unicas = {r[2] for r in registros if r[2]}
+    entraram = len(matriculas_unicas)
+    total = _total_alunos() or entraram
+    nao_entraram = max(total - entraram, 0)
+    return {"entraram": entraram, "naoEntraram": nao_entraram, "total": total}
+
+
+def _broadcast_refeitorio():
+    """Envia dados atualizados para todos os clientes WS conectados."""
+    import json
+    mortos = set()
+    dados = json.dumps(_payload_refeitorio())
+    for ws in _ws_clientes_refeitorio:
+        try:
+            ws.send(dados)
+        except Exception:
+            mortos.add(ws)
+    _ws_clientes_refeitorio.difference_update(mortos)
+
+
+@app.route("/refeitorio/hoje", methods=["GET"])
+def refeitorio_hoje():
+    """Rota REST para o tv.html (modo polling).
+
+    Retorna: { "entraram": N, "naoEntraram": N, "total": N }
+    """
+    try:
+        return jsonify(_payload_refeitorio())
+    except RuntimeError:
+        return jsonify({"erro": "Banco de dados indisponivel"}), 503
+
+
+@sock.route("/ws/refeitorio")
+def ws_refeitorio(ws):
+    """WebSocket para o tv.html (modo tempo real).
+
+    O cliente se conecta e recebe dados sempre que houver novo registro.
+    Também recebe um push imediato ao conectar.
+    """
+    import json
+    _ws_clientes_refeitorio.add(ws)
+    try:
+        # Envia estado atual imediatamente ao conectar
+        ws.send(json.dumps(_payload_refeitorio()))
+        # Mantém conexão viva aguardando mensagens (ping/keep-alive do cliente)
+        while True:
+            msg = ws.receive(timeout=30)
+            if msg is None:
+                break  # cliente desconectou
+    except Exception:
+        pass
+    finally:
+        _ws_clientes_refeitorio.discard(ws)
 
 
 if __name__ == "__main__":
