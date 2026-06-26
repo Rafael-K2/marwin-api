@@ -32,14 +32,13 @@ import secrets
 import marwin_db as db
 from flask_sock import Sock
 
-sock = Sock(app)
-_ws_clientes_refeitorio = set()   # clientes WebSocket conectados ao painel TV
-
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("marwin.api")
 
 app = Flask(__name__)
 CORS(app)
+sock = Sock(app)
+_ws_clientes_refeitorio = set()   # clientes WebSocket conectados ao painel TV
 
 ADMIN_PASSWORD = os.getenv("MARWIN_ADMIN_PASS", "Marwin2026")
 
