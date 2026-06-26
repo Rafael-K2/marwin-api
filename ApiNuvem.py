@@ -130,12 +130,19 @@ def put_config():
         return jsonify({"erro": str(e)}), 500
 
 
+FUSO_BRASIL = datetime.timezone(datetime.timedelta(hours=-3))
+
+def _hoje_br():
+    """Retorna a data atual no fuso horário do Brasil (UTC-3)."""
+    return datetime.datetime.now(FUSO_BRASIL).date()
+
+
 @app.route("/avaliacao/verificar", methods=["GET"])
 def verificar_avaliacao():
     nome = request.args.get("nome", "").strip()
     if not nome or nome.lower() in {"anonimo", "anônimo"}:
         return jsonify({"ja_avaliou": False}), 200
-    hoje = datetime.date.today()
+    hoje = _hoje_br()
     try:
         ja = db.avaliacao_ja_existe_db(nome, hoje.isocalendar()[1], hoje.isocalendar()[0])
         return jsonify({"ja_avaliou": ja}), 200
@@ -154,7 +161,7 @@ def post_avaliacao():
     respostas = dados.get("respostas", {})
 
     if nome and nome.strip().lower() not in {"anonimo", "anônimo"}:
-        hoje = datetime.date.today()
+        hoje = _hoje_br()
         try:
             if db.avaliacao_ja_existe_db(nome, hoje.isocalendar()[1], hoje.isocalendar()[0]):
                 return jsonify({"status": "ja_avaliou", "mensagem": "Você já avaliou esta semana"}), 200
