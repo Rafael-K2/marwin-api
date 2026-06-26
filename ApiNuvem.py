@@ -277,11 +277,26 @@ def registrar_frequencia():
 
 
 def _total_alunos():
-    """Retorna o total de alunos cadastrados para calcular ausências no TV."""
+    """Retorna o total de alunos cadastrados para calcular ausências no TV.
+
+    Ordem de prioridade:
+    1. lista_alunos sincronizada via /admin/lista-alunos (mais precisa)
+    2. Matrículas únicas históricas da tabela frequencia (boa aproximação)
+    3. None — o chamador usa entraram como total (sem mostrar ausências)
+    """
     try:
         lista = db.ler_config_kv("lista_alunos", [])
         if isinstance(lista, list) and len(lista) > 0:
             return len(lista)
+    except Exception:
+        pass
+    try:
+        rows = db.executar_pg(
+            "SELECT COUNT(DISTINCT matricula) AS total FROM frequencia",
+            (), fetch=True
+        )
+        if rows and rows[0].get("total", 0) > 0:
+            return int(rows[0]["total"])
     except Exception:
         pass
     return None

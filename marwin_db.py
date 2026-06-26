@@ -15,12 +15,12 @@ _BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DADOS_DIR = os.path.join(_BASE_DIR, "dados")
 DB_CONFIG_FILE = os.path.join(DADOS_DIR, "db_config.json")
 
+# ⚠️  NUNCA coloque a connection string diretamente aqui.
+# Configure a variável de ambiente MARWIN_DATABASE_URL (ou DATABASE_URL)
+# no sistema operacional, no Railway, ou no Render antes de rodar.
 DB_DEFAULT_CONNECTION = os.getenv(
     "MARWIN_DATABASE_URL",
-    os.getenv(
-        "DATABASE_URL",
-        "postgresql://neondb_owner:npg_ydP7rqBR0ZoQ@ep-broad-mountain-apatc77i-pooler.c-7.us-east-1.aws.neon.tech/neondb?sslmode=require&channel_binding=require",
-    ),
+    os.getenv("DATABASE_URL", ""),   # vazio = falha clara em vez de conectar com credenciais antigas
 )
 
 PG_POOL = None
