@@ -360,6 +360,23 @@ def ws_refeitorio(ws):
         _ws_clientes_refeitorio.discard(ws)
 
 
+@app.route("/admin/lista-alunos", methods=["PUT"])
+def put_lista_alunos():
+    """Sincroniza a lista de alunos do painel desktop para o Neon."""
+    if not checar_senha(request):
+        return jsonify({"erro": "Acesso negado"}), 403
+    dados = request.get_json()
+    if not isinstance(dados, list):
+        return jsonify({"erro": "Lista esperada"}), 400
+    try:
+        db.salvar_config_kv("lista_alunos", dados)
+        logger.info(f"Lista de alunos sincronizada: {len(dados)} alunos")
+        return jsonify({"status": "ok", "total": len(dados)})
+    except Exception as e:
+        logger.error(f"Erro ao salvar lista_alunos: {e}")
+        return jsonify({"erro": str(e)}), 500
+
+
 if __name__ == "__main__":
     db.iniciar_pool_pg()
     try:
