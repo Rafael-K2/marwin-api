@@ -40,7 +40,7 @@ EVENTOS_PADRAO = [
     {"data": "15/10", "evento": "Dia do Professor"},
     {"data": "25/12", "evento": "Natal"},
 ]
-CONFIG_PADRAO = {"avaliacoes_ativas": True, "modo_leitura": "camera"}
+CONFIG_PADRAO = {"avaliacoes_ativas": True, "modo_leitura": "camera", "painel_avisos": []}
 
 
 def ler_json(path, padrao):
