@@ -139,6 +139,8 @@ def criar_tabelas():
         );
         """
     )
+    executar_pg("CREATE INDEX IF NOT EXISTS idx_refeitorio_data ON refeitorio (data)")
+    executar_pg("CREATE INDEX IF NOT EXISTS idx_refeitorio_data_matricula ON refeitorio (data, matricula)")
     executar_pg(
         """
         CREATE TABLE IF NOT EXISTS frequencia (
@@ -152,6 +154,8 @@ def criar_tabelas():
         );
         """
     )
+    executar_pg("CREATE INDEX IF NOT EXISTS idx_frequencia_data ON frequencia (data)")
+    executar_pg("CREATE INDEX IF NOT EXISTS idx_frequencia_data_matricula ON frequencia (data, matricula)")
     executar_pg(
         """
         CREATE TABLE IF NOT EXISTS avaliacoes (
@@ -165,6 +169,8 @@ def criar_tabelas():
         );
         """
     )
+    executar_pg("CREATE INDEX IF NOT EXISTS idx_avaliacoes_data ON avaliacoes (data)")
+    executar_pg("CREATE INDEX IF NOT EXISTS idx_avaliacoes_data_aluno ON avaliacoes (data, aluno)")
     executar_pg(
         """
         CREATE TABLE IF NOT EXISTS sistema_config (
@@ -348,22 +354,22 @@ def inserir_avaliacao_db(registro):
 def avaliacao_ja_existe_db(nome, semana_iso, ano_iso):
     if not nome:
         return False
+    data_inicio = datetime.date.fromisocalendar(ano_iso, semana_iso, 1)
+    data_fim = data_inicio + datetime.timedelta(days=6)
+    data_inicio_str = data_inicio.strftime("%d/%m/%Y")
+    data_fim_str = data_fim.strftime("%d/%m/%Y")
     try:
         rows = executar_pg(
-            "SELECT data FROM avaliacoes WHERE lower(aluno) = lower(%s)",
-            (nome,),
+            """
+            SELECT 1
+            FROM avaliacoes
+            WHERE lower(aluno) = lower(%s)
+              AND data BETWEEN %s AND %s
+            LIMIT 1
+            """,
+            (nome, data_inicio_str, data_fim_str),
             fetch=True,
         )
     except Exception:
         return False
-    if not rows:
-        return False
-    for row in rows:
-        try:
-            data_str = row["data"].split(" ")[0]
-            data_obj = datetime.datetime.strptime(data_str, "%d/%m/%Y").date()
-            if data_obj.isocalendar()[1] == semana_iso and data_obj.isocalendar()[0] == ano_iso:
-                return True
-        except Exception:
-            continue
-    return False
+    return bool(rows)

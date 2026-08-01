@@ -18,6 +18,9 @@ import sys
 import subprocess
 import logging
 import datetime
+import time
+from pathlib import Path
+from collections import defaultdict
 
 for pkg in ["flask", "flask-cors", "psycopg2-binary", "flask-sock"]:
     try:
@@ -38,9 +41,47 @@ logger = logging.getLogger("marwin.api")
 app = Flask(__name__)
 CORS(app)
 sock = Sock(app)
+# ⚠️ Este conjunto fica em memória e só funciona corretamente com um único worker.
+# Se a carga crescer, migre para Redis pub/sub ou outro broker para fan-out.
 _ws_clientes_refeitorio = set()   # clientes WebSocket conectados ao painel TV
 
-ADMIN_PASSWORD = os.getenv("MARWIN_ADMIN_PASS", "Marwin2026")
+def _senha_admin_fallback():
+    base_dir = Path(__file__).resolve().parents[1]
+    senha_path = base_dir / "Servidor" / "dados" / "senha_admin.txt"
+    senha_path.parent.mkdir(parents=True, exist_ok=True)
+    if senha_path.exists():
+        return senha_path.read_text(encoding="utf-8").strip()
+    senha = secrets.token_urlsafe(18)
+    senha_path.write_text(senha, encoding="utf-8")
+    return senha
+
+ADMIN_PASSWORD = os.getenv("MARWIN_ADMIN_PASS")
+if not ADMIN_PASSWORD:
+    if os.getenv("MARWIN_ALLOW_DEFAULT_ADMIN") == "1":
+        ADMIN_PASSWORD = _senha_admin_fallback()
+        logger.warning("MARWIN_ADMIN_PASS não definido; usando senha local gerada em Servidor/dados/senha_admin.txt")
+    else:
+        raise RuntimeError("MARWIN_ADMIN_PASS deve ser definida para iniciar a API")
+
+try:
+    import sentry_sdk
+    from sentry_sdk.integrations.flask import FlaskIntegration
+    if os.getenv("SENTRY_DSN"):
+        sentry_sdk.init(
+            dsn=os.getenv("SENTRY_DSN"),
+            integrations=[FlaskIntegration()],
+            traces_sample_rate=float(os.getenv("SENTRY_TRACES_SAMPLE_RATE", "0.1")),
+        )
+except Exception:
+    sentry_sdk = None
+
+RATE_LIMIT_BUCKETS = defaultdict(list)
+PROFILE_TOKENS = {
+    "ADM": os.getenv("MARWIN_ADM_TOKEN") or os.getenv("MARWIN_ADMIN_TOKEN"),
+    "COOR": os.getenv("MARWIN_COOR_TOKEN"),
+    "SERC": os.getenv("MARWIN_SERC_TOKEN"),
+    "REFEITORIO": os.getenv("MARWIN_REFEITORIO_TOKEN"),
+}
 
 # Timestamp do último dado inserido — usado pelo polling do index.html
 _ultimo_update_ts = None
@@ -56,16 +97,43 @@ except Exception:
     BCRYPT_AVAILABLE = False
 
 
+def _excedeu_rate_limit(req):
+    if not request.path.startswith("/admin/"):
+        return False
+    now = time.monotonic()
+    bucket = f"{req.remote_addr or 'unknown'}:{req.headers.get('X-Senha', '')[:8]}"
+    timestamps = RATE_LIMIT_BUCKETS[bucket]
+    timestamps[:] = [t for t in timestamps if now - t < 60]
+    if len(timestamps) >= 30:
+        return True
+    timestamps.append(now)
+    return False
+
+
+@app.before_request
+def _aplicar_rate_limit_admin():
+    if _excedeu_rate_limit(request):
+        return jsonify({"erro": "Muitas tentativas de acesso. Tente novamente mais tarde."}), 429
+
+
 def checar_senha(req):
     hdr = req.headers.get("X-Senha", "")
-    if not hdr:
-        return False
-    if BCRYPT_AVAILABLE and isinstance(ADMIN_PASSWORD, str) and ADMIN_PASSWORD.startswith("$2"):
-        try:
-            return bcrypt.checkpw(hdr.encode("utf-8"), ADMIN_PASSWORD.encode("utf-8"))
-        except Exception:
-            return False
-    return secrets.compare_digest(hdr, ADMIN_PASSWORD)
+    if hdr:
+        if BCRYPT_AVAILABLE and isinstance(ADMIN_PASSWORD, str) and ADMIN_PASSWORD.startswith("$2"):
+            try:
+                return bcrypt.checkpw(hdr.encode("utf-8"), ADMIN_PASSWORD.encode("utf-8"))
+            except Exception:
+                return False
+        if secrets.compare_digest(hdr, ADMIN_PASSWORD):
+            return True
+
+    perfil = (req.headers.get("X-Perfil", "") or "").strip().upper()
+    token = (req.headers.get("X-Token", "") or "").strip()
+    if perfil and token:
+        expected = PROFILE_TOKENS.get(perfil)
+        if expected and secrets.compare_digest(token, expected):
+            return True
+    return False
 
 
 @app.route("/health", methods=["GET"])
@@ -354,8 +422,8 @@ def ws_refeitorio(ws):
             msg = ws.receive(timeout=30)
             if msg is None:
                 break  # cliente desconectou
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.warning(f"WebSocket do refeitório encerrado: {exc}")
     finally:
         _ws_clientes_refeitorio.discard(ws)
 
