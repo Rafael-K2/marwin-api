@@ -39,7 +39,21 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger("marwin.api")
 
 app = Flask(__name__)
-CORS(app)
+# Antes CORS(app) liberava QUALQUER site do navegador de qualquer pessoa a
+# chamar a API. Agora só os domínios em MARWIN_CORS_ORIGINS (separados por
+# vírgula) podem — normalmente o(s) domínio(s) do GitHub Pages onde o
+# index.html/educadores/TV estão publicados. Sem a variável definida, cai
+# num fallback aberto (mantém funcionando) mas avisa no log.
+_cors_origins_env = os.getenv("MARWIN_CORS_ORIGINS", "").strip()
+if _cors_origins_env:
+    _cors_origins = [o.strip() for o in _cors_origins_env.split(",") if o.strip()]
+else:
+    _cors_origins = "*"
+    logger.warning(
+        "MARWIN_CORS_ORIGINS não definida — CORS está aberto para qualquer origem. "
+        "Defina MARWIN_CORS_ORIGINS=https://seuusuario.github.io para restringir."
+    )
+CORS(app, origins=_cors_origins)
 sock = Sock(app)
 # ⚠️ Este conjunto fica em memória e só funciona corretamente com um único worker.
 # Se a carga crescer, migre para Redis pub/sub ou outro broker para fan-out.
@@ -63,6 +77,18 @@ if not ADMIN_PASSWORD:
     else:
         raise RuntimeError("MARWIN_ADMIN_PASS deve ser definida para iniciar a API")
 
+# Senha do painel dos Educadores (alunos monitores do refeitório/frequência).
+# Validada aqui no servidor (a página só manda a senha digitada, a API
+# confirma ou não) — assim dá pra trocar sem reeditar e republicar o HTML.
+# Senha padrão fixa, sobrescrevível por MARWIN_EDUCADOR_PASS quando quiser.
+DEFAULT_EDUCADOR_PLAIN = "Educador2026"
+EDUCADOR_PASSWORD = os.getenv("MARWIN_EDUCADOR_PASS") or DEFAULT_EDUCADOR_PLAIN
+if EDUCADOR_PASSWORD == DEFAULT_EDUCADOR_PLAIN:
+    logger.warning(
+        "MARWIN_EDUCADOR_PASS não definida — usando a senha padrão do painel "
+        "dos Educadores. Defina a variável de ambiente para usar uma senha própria."
+    )
+
 try:
     import sentry_sdk
     from sentry_sdk.integrations.flask import FlaskIntegration
@@ -83,12 +109,17 @@ PROFILE_TOKENS = {
     "REFEITORIO": os.getenv("MARWIN_REFEITORIO_TOKEN"),
 }
 
-# Timestamp do último dado inserido — usado pelo polling do index.html
-_ultimo_update_ts = None
-
+# Timestamp do último dado inserido — usado pelo polling do index.html.
+# Persistido no Neon (marwin_db.ler/marcar_ultimo_update_ts) em vez de
+# variável em memória: uma global em RAM some a cada reinício/deploy e
+# quebra se a API algum dia rodar com mais de um worker no Render.
 @app.route("/ultimo-update", methods=["GET"])
 def ultimo_update():
-    return jsonify({"ts": _ultimo_update_ts})
+    try:
+        return jsonify({"ts": db.ler_ultimo_update_ts()})
+    except Exception as e:
+        logger.warning(f"Falha ao ler ultimo_update_ts: {e}")
+        return jsonify({"ts": None})
 
 try:
     import bcrypt
@@ -98,7 +129,7 @@ except Exception:
 
 
 def _excedeu_rate_limit(req):
-    if not request.path.startswith("/admin/"):
+    if not (request.path.startswith("/admin/") or request.path.startswith("/auth/")):
         return False
     now = time.monotonic()
     bucket = f"{req.remote_addr or 'unknown'}:{req.headers.get('X-Senha', '')[:8]}"
@@ -139,6 +170,17 @@ def checar_senha(req):
 @app.route("/health", methods=["GET"])
 def health():
     return jsonify({"status": "ok", "servico": "marwin-api"})
+
+
+@app.route("/auth/educador", methods=["POST"])
+def auth_educador():
+    """Confirma a senha do painel dos Educadores. A página não guarda mais
+    a senha no código-fonte — só manda o que o usuário digitou pra cá."""
+    dados = request.get_json(silent=True) or {}
+    senha = (dados.get("senha") or "").strip()
+    if senha and secrets.compare_digest(senha, EDUCADOR_PASSWORD):
+        return jsonify({"ok": True})
+    return jsonify({"ok": False}), 401
 
 
 @app.route("/cardapio", methods=["GET"])
@@ -186,6 +228,65 @@ def put_eventos():
         return jsonify({"erro": str(e)}), 500
 
 
+# ── Respostas da gestão às avaliações ───────────────────────────────────────
+# Desativado por enquanto (não está em uso). Pra reativar, é só voltar
+# RESPOSTAS_GESTAO_ATIVO pra True — o resto do código continua intacto.
+RESPOSTAS_GESTAO_ATIVO = False
+
+# Antes a comunicação era só de mão única: aluno avalia toda sexta, ninguém
+# responde. GET é público (o app do aluno mostra pra todo mundo); criar e
+# apagar exigem autenticação de admin (mesmo X-Senha usado nas outras
+# rotas /admin/).
+@app.route("/respostas", methods=["GET"])
+def get_respostas():
+    if not RESPOSTAS_GESTAO_ATIVO:
+        return jsonify([]), 200
+    try:
+        limite = min(int(request.args.get("limite", 20)), 100)
+    except (TypeError, ValueError):
+        limite = 20
+    try:
+        return jsonify(db.ler_respostas_gestao_db(limite))
+    except RuntimeError:
+        return jsonify([]), 200
+
+
+@app.route("/admin/respostas", methods=["POST"])
+def post_resposta():
+    if not RESPOSTAS_GESTAO_ATIVO:
+        return jsonify({"erro": "Recurso desativado"}), 404
+    if not checar_senha(request):
+        return jsonify({"erro": "Acesso negado"}), 403
+    dados = request.get_json(silent=True) or {}
+    titulo = (dados.get("titulo") or "").strip()
+    mensagem = (dados.get("mensagem") or "").strip()
+    setor = (dados.get("setor") or "Geral").strip()
+    autor = (dados.get("autor") or request.headers.get("X-Perfil") or "").strip() or None
+    if not titulo or not mensagem:
+        return jsonify({"erro": "Título e mensagem são obrigatórios"}), 400
+    try:
+        db.inserir_resposta_gestao_db(setor, titulo, mensagem, autor)
+        return jsonify({"status": "ok"})
+    except Exception as e:
+        logger.error(f"Erro ao salvar resposta da gestão: {e}")
+        return jsonify({"erro": str(e)}), 500
+
+
+@app.route("/admin/respostas/<int:resposta_id>", methods=["DELETE"])
+def delete_resposta(resposta_id):
+    if not RESPOSTAS_GESTAO_ATIVO:
+        return jsonify({"erro": "Recurso desativado"}), 404
+    if not checar_senha(request):
+        return jsonify({"erro": "Acesso negado"}), 403
+    try:
+        db.apagar_resposta_gestao_db(resposta_id)
+        return jsonify({"status": "ok"})
+    except Exception as e:
+        logger.error(f"Erro ao apagar resposta da gestão: {e}")
+        return jsonify({"erro": str(e)}), 500
+
+
+
 @app.route("/admin/config", methods=["PUT"])
 def put_config():
     if not checar_senha(request):
@@ -211,11 +312,13 @@ def _hoje_br():
 @app.route("/avaliacao/verificar", methods=["GET"])
 def verificar_avaliacao():
     nome = request.args.get("nome", "").strip()
+    serie = request.args.get("serie", "").strip()
+    curso = request.args.get("curso", "").strip()
     if not nome or nome.lower() in {"anonimo", "anônimo"}:
         return jsonify({"ja_avaliou": False}), 200
     hoje = _hoje_br()
     try:
-        ja = db.avaliacao_ja_existe_db(nome, hoje.isocalendar()[1], hoje.isocalendar()[0])
+        ja = db.avaliacao_ja_existe_db(nome, hoje.isocalendar()[1], hoje.isocalendar()[0], serie=serie, curso=curso)
         return jsonify({"ja_avaliou": ja}), 200
     except RuntimeError:
         return jsonify({"erro": "Banco de dados indisponível"}), 503
@@ -234,7 +337,9 @@ def post_avaliacao():
     if nome and nome.strip().lower() not in {"anonimo", "anônimo"}:
         hoje = _hoje_br()
         try:
-            if db.avaliacao_ja_existe_db(nome, hoje.isocalendar()[1], hoje.isocalendar()[0]):
+            # Compara nome + serie + curso — não só o nome — para não
+            # bloquear alunos homônimos de turmas diferentes entre si.
+            if db.avaliacao_ja_existe_db(nome, hoje.isocalendar()[1], hoje.isocalendar()[0], serie=serie, curso=curso):
                 return jsonify({"status": "ja_avaliou", "mensagem": "Você já avaliou esta semana"}), 200
         except RuntimeError:
             return jsonify({"erro": "Banco de dados indisponível"}), 503
@@ -249,8 +354,7 @@ def post_avaliacao():
     except Exception as e:
         logger.error(f"Erro ao salvar avaliação: {e}")
         return jsonify({"erro": "Erro ao salvar avaliação"}), 500
-    global _ultimo_update_ts
-    _ultimo_update_ts = datetime.datetime.now().isoformat()
+    db.marcar_ultimo_update_ts()
     logger.info(f"Avaliação: {nome} ({len(respostas)} itens)")
     return jsonify({"status": "ok"})
 
@@ -287,8 +391,7 @@ def registrar_refeicao():
     except RuntimeError:
         return jsonify({"erro": "Banco de dados indisponível"}), 503
 
-    global _ultimo_update_ts
-    _ultimo_update_ts = datetime.datetime.now().isoformat()
+    db.marcar_ultimo_update_ts()
     _broadcast_refeitorio()
     registros = db.ler_refeitorio_hoje_db()
     total_refeicao = sum(1 for r in registros if r[6] == refeicao)
@@ -332,8 +435,7 @@ def registrar_frequencia():
     except RuntimeError:
         return jsonify({"erro": "Banco de dados indisponível"}), 503
 
-    global _ultimo_update_ts
-    _ultimo_update_ts = datetime.datetime.now().isoformat()
+    db.marcar_ultimo_update_ts()
     registros = db.ler_frequencia_hoje_db()
     return jsonify({
         "status": "ok",
@@ -445,6 +547,13 @@ def put_lista_alunos():
         return jsonify({"erro": str(e)}), 500
 
 
+@app.route("/rotas", methods=["GET"])
+def listar_rotas():
+    return jsonify(
+        sorted([str(r) for r in app.url_map.iter_rules()])
+    )
+
+
 if __name__ == "__main__":
     db.iniciar_pool_pg()
     try:
@@ -454,9 +563,3 @@ if __name__ == "__main__":
     port = int(os.getenv("PORT", "8080"))
     logger.info(f"API MARWIN na porta {port}")
     app.run(host="0.0.0.0", port=port, debug=False)
-    
-@app.route("/rotas", methods=["GET"])
-def listar_rotas():
-    return jsonify(
-        sorted([str(r) for r in app.url_map.iter_rules()])
-    )

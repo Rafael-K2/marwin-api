@@ -67,7 +67,7 @@ def iniciar_pool_pg():
     cfg = _carregar_db_config()
     try:
         from psycopg2 import pool
-        PG_POOL = pool.ThreadedConnectionPool(1, 10, cfg["connection_string"])
+        PG_POOL = pool.ThreadedConnectionPool(1, 10, cfg["connection_string"], connect_timeout=10)
         logger.info("Pool PostgreSQL inicializado")
     except Exception as e:
         PG_POOL = None
@@ -179,6 +179,25 @@ def criar_tabelas():
         );
         """
     )
+    # Respostas da gestão às avaliações semanais dos alunos. Antes a
+    # comunicação era só de mão única (aluno avalia, ninguém responde).
+    # `setor` é um dos 4 setores avaliados (Comida/Limpeza/Ensino/
+    # Acolhimento) ou "Geral" para um recado que não é sobre um setor
+    # específico. Visível a todos os alunos no app (não é uma resposta
+    # individual — a maioria das avaliações é anônima ou agregada).
+    executar_pg(
+        """
+        CREATE TABLE IF NOT EXISTS respostas_gestao (
+            id SERIAL PRIMARY KEY,
+            criado_em TEXT NOT NULL,
+            setor TEXT NOT NULL DEFAULT 'Geral',
+            titulo TEXT NOT NULL,
+            mensagem TEXT NOT NULL,
+            autor TEXT
+        );
+        """
+    )
+    executar_pg("CREATE INDEX IF NOT EXISTS idx_respostas_gestao_criado_em ON respostas_gestao (criado_em)")
 
 
 def hoje():
@@ -351,25 +370,159 @@ def inserir_avaliacao_db(registro):
     )
 
 
-def avaliacao_ja_existe_db(nome, semana_iso, ano_iso):
+def avaliacao_ja_existe_db(nome, semana_iso, ano_iso, serie=None, curso=None):
+    """Verifica se o aluno já avaliou nesta semana ISO.
+
+    Compara nome + série + curso (não só o nome) para evitar que dois
+    alunos homônimos (nome igual, turma diferente) se bloqueiem
+    mutuamente — situação comum em escolas grandes.
+
+    A coluna `data` é armazenada como texto "DD/MM/AAAA". Comparar essas
+    strings diretamente com BETWEEN (ordem alfabética) dá resultado errado
+    sempre que a semana atravessa uma virada de mês — ex.: "01/02/2026"
+    vem alfabeticamente ANTES de "28/01/2026", mesmo sendo uma data
+    posterior. Por isso convertemos para DATE de verdade com TO_DATE antes
+    de comparar. O filtro `data ~ '^\\d{2}/\\d{2}/\\d{4}$'` evita que uma
+    linha com data mal formatada quebre a consulta inteira.
+    """
     if not nome:
         return False
     data_inicio = datetime.date.fromisocalendar(ano_iso, semana_iso, 1)
     data_fim = data_inicio + datetime.timedelta(days=6)
-    data_inicio_str = data_inicio.strftime("%d/%m/%Y")
-    data_fim_str = data_fim.strftime("%d/%m/%Y")
     try:
         rows = executar_pg(
             """
             SELECT 1
             FROM avaliacoes
             WHERE lower(aluno) = lower(%s)
-              AND data BETWEEN %s AND %s
+              AND lower(COALESCE(serie, '')) = lower(COALESCE(%s, ''))
+              AND lower(COALESCE(curso, '')) = lower(COALESCE(%s, ''))
+              AND data ~ '^\\d{2}/\\d{2}/\\d{4}$'
+              AND TO_DATE(data, 'DD/MM/YYYY') BETWEEN %s AND %s
             LIMIT 1
             """,
-            (nome, data_inicio_str, data_fim_str),
+            (nome, serie, curso, data_inicio, data_fim),
             fetch=True,
         )
     except Exception:
         return False
     return bool(rows)
+
+
+def ler_refeitorio_periodo_db(data_inicio, data_fim, serie=None, curso=None):
+    """Retorna registros de refeitório entre duas datas (inclusive), já
+    filtrados no banco — em vez de trazer a tabela inteira e filtrar em
+    Python (era o que a aba Histórico fazia antes; ficava mais lento a
+    cada mês que passava).
+
+    data_inicio / data_fim: objetos datetime.date.
+    serie / curso: opcional, filtro parcial (contém), igual ao filtro que
+    já existia na tela.
+    """
+    sql = """
+        SELECT data, horaentrada, matricula, nome, serie, curso, refeicao
+        FROM refeitorio
+        WHERE data ~ '^\\d{2}/\\d{2}/\\d{4}$'
+          AND TO_DATE(data, 'DD/MM/YYYY') BETWEEN %s AND %s
+    """
+    params = [data_inicio, data_fim]
+    if serie:
+        sql += " AND serie ILIKE %s"
+        params.append(f"%{serie}%")
+    if curso:
+        sql += " AND curso ILIKE %s"
+        params.append(f"%{curso}%")
+    rows = executar_pg(sql, tuple(params), fetch=True)
+    return [
+        [row["data"], row["horaentrada"], row["matricula"], row["nome"], row["serie"], row["curso"], row["refeicao"]]
+        for row in rows
+    ]
+
+
+def ler_frequencia_periodo_db(data_inicio, data_fim, serie=None, curso=None):
+    """Mesma ideia de ler_refeitorio_periodo_db, para a tabela frequencia."""
+    sql = """
+        SELECT data, horaentrada, matricula, nome, serie, curso, aula
+        FROM frequencia
+        WHERE data ~ '^\\d{2}/\\d{2}/\\d{4}$'
+          AND TO_DATE(data, 'DD/MM/YYYY') BETWEEN %s AND %s
+    """
+    params = [data_inicio, data_fim]
+    if serie:
+        sql += " AND serie ILIKE %s"
+        params.append(f"%{serie}%")
+    if curso:
+        sql += " AND curso ILIKE %s"
+        params.append(f"%{curso}%")
+    rows = executar_pg(sql, tuple(params), fetch=True)
+    return [
+        [row["data"], row["horaentrada"], row["matricula"], row["nome"], row["serie"], row["curso"], row["aula"]]
+        for row in rows
+    ]
+
+
+# ── Classificação de nota (Bom/Médio/Ruim) ──────────────────────────────────
+# Antes essa mesma regra (nota>=4 → Bom, nota>=2 → Médio, senão Ruim)
+# estava copiada em 3 arquivos diferentes do painel (pagina_avaliacoes.py,
+# pagina_relatorio_ensino.py, pagina_relatorio_semanal.py). Hoje os três
+# concordam entre si, mas cada um podia divergir silenciosamente se algum
+# dia alguém mudasse o critério em só um lugar. Centralizando aqui.
+def classificar_nota(nota):
+    """Recebe uma nota (int/float/str numérica) de 1 a 5 e retorna
+    'Bom', 'Medio' ou 'Ruim'. Retorna None se a nota não for numérica."""
+    try:
+        n = float(str(nota).strip().replace(",", "."))
+    except (TypeError, ValueError):
+        return None
+    if n >= 4:
+        return "Bom"
+    if n >= 2:
+        return "Medio"
+    return "Ruim"
+
+
+# ── Timestamp da última atualização (para polling do painel/index) ─────────
+# Persistido no Neon (tabela sistema_config) em vez de variável em memória:
+# assim funciona corretamente mesmo se a API reiniciar ou rodar com mais de
+# um worker no futuro.
+def ler_ultimo_update_ts():
+    valor = ler_config_kv("ultimo_update_ts", {"ts": None})
+    if isinstance(valor, dict):
+        return valor.get("ts")
+    return None
+
+
+def marcar_ultimo_update_ts():
+    ts = datetime.datetime.now().isoformat()
+    try:
+        salvar_config_kv("ultimo_update_ts", {"ts": ts})
+    except Exception as e:
+        logger.warning(f"Falha ao persistir ultimo_update_ts: {e}")
+    return ts
+
+# ── Respostas da gestão às avaliações ───────────────────────────────────────
+SETORES_AVALIACAO = ["Geral", "Comida", "Limpeza", "Ensino", "Acolhimento"]
+
+
+def inserir_resposta_gestao_db(setor, titulo, mensagem, autor=None):
+    setor = setor if setor in SETORES_AVALIACAO else "Geral"
+    criado_em = hoje() + " " + datetime.datetime.now().strftime("%H:%M")
+    executar_pg(
+        "INSERT INTO respostas_gestao (criado_em, setor, titulo, mensagem, autor) "
+        "VALUES (%s, %s, %s, %s, %s)",
+        (criado_em, setor, titulo, mensagem, autor),
+    )
+
+
+def ler_respostas_gestao_db(limite=20):
+    rows = executar_pg(
+        "SELECT id, criado_em, setor, titulo, mensagem, autor FROM respostas_gestao "
+        "ORDER BY id DESC LIMIT %s",
+        (limite,),
+        fetch=True,
+    )
+    return rows or []
+
+
+def apagar_resposta_gestao_db(resposta_id):
+    executar_pg("DELETE FROM respostas_gestao WHERE id = %s", (resposta_id,))
