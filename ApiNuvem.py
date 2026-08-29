@@ -329,6 +329,19 @@ def post_avaliacao():
     dados = request.get_json()
     if not dados:
         return jsonify({"erro": "JSON invalido"}), 400
+
+    # Antes só o app do aluno escondia o botão de avaliar quando esse
+    # toggle estava desligado (checagem só do lado do cliente) — se o app
+    # não tivesse buscado a config mais recente por qualquer motivo (cache,
+    # rede), a avaliação passava mesmo assim. Agora o servidor também
+    # recusa de verdade.
+    try:
+        cfg_sys = db.ler_config_kv("config", db.CONFIG_PADRAO)
+    except Exception:
+        cfg_sys = db.CONFIG_PADRAO
+    if not cfg_sys.get("avaliacoes_ativas", True):
+        return jsonify({"erro": "Avaliações desativadas no momento"}), 403
+
     nome = dados.get("nome", "Anonimo")
     serie = dados.get("serie", "N/A")
     curso = dados.get("curso", "N/A")

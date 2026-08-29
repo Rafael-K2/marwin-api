@@ -377,13 +377,13 @@ def avaliacao_ja_existe_db(nome, semana_iso, ano_iso, serie=None, curso=None):
     alunos homônimos (nome igual, turma diferente) se bloqueiem
     mutuamente — situação comum em escolas grandes.
 
-    A coluna `data` é armazenada como texto "DD/MM/AAAA". Comparar essas
-    strings diretamente com BETWEEN (ordem alfabética) dá resultado errado
-    sempre que a semana atravessa uma virada de mês — ex.: "01/02/2026"
-    vem alfabeticamente ANTES de "28/01/2026", mesmo sendo uma data
-    posterior. Por isso convertemos para DATE de verdade com TO_DATE antes
-    de comparar. O filtro `data ~ '^\\d{2}/\\d{2}/\\d{4}$'` evita que uma
-    linha com data mal formatada quebre a consulta inteira.
+    Diferente de refeitorio/frequencia (que guardam só a data), a coluna
+    `data` de avaliacoes vem como "DD/MM/AAAA HH:MM:SS" (a hora é gravada
+    junto, sem coluna própria). Por isso pegamos só os 10 primeiros
+    caracteres (SUBSTRING) antes de converter com TO_DATE — comparar a
+    string inteira com BETWEEN (ordem alfabética) dá errado em viradas de
+    mês, e um regex que exigisse o texto ser só a data (sem a hora depois)
+    nunca bateria com nenhuma linha real dessa tabela.
     """
     if not nome:
         return False
@@ -397,8 +397,8 @@ def avaliacao_ja_existe_db(nome, semana_iso, ano_iso, serie=None, curso=None):
             WHERE lower(aluno) = lower(%s)
               AND lower(COALESCE(serie, '')) = lower(COALESCE(%s, ''))
               AND lower(COALESCE(curso, '')) = lower(COALESCE(%s, ''))
-              AND data ~ '^\\d{2}/\\d{2}/\\d{4}$'
-              AND TO_DATE(data, 'DD/MM/YYYY') BETWEEN %s AND %s
+              AND data ~ '^\\d{2}/\\d{2}/\\d{4}'
+              AND TO_DATE(SUBSTRING(data FROM 1 FOR 10), 'DD/MM/YYYY') BETWEEN %s AND %s
             LIMIT 1
             """,
             (nome, serie, curso, data_inicio, data_fim),
