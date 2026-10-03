@@ -459,6 +459,39 @@ def registrar_frequencia():
     }), 200
 
 
+@app.route("/almoco/registrar", methods=["POST"])
+def registrar_almoco():
+    """Resposta do totem à pergunta "vai almoçar hoje?" -> alimenta a aba Refeitório."""
+    dados = request.get_json()
+    if not dados:
+        return jsonify({"erro": "JSON invalido"}), 400
+
+    matricula = db.limpar_campo_usb(str(dados.get("matricula", "")).strip())
+    if not matricula:
+        return jsonify({"erro": "Matricula nao informada"}), 400
+
+    bruto = str(dados.get("vai_almocar", "")).strip().lower()
+    if bruto in ("sim", "true", "1"):
+        vai = True
+    elif bruto in ("nao", "não", "false", "0"):
+        vai = False
+    else:
+        return jsonify({"erro": "vai_almocar deve ser sim ou nao"}), 400
+
+    nome = db.limpar_campo_usb(str(dados.get("nome", "Desconhecido")).strip()) or "Desconhecido"
+    serie = db.limpar_campo_usb(str(dados.get("serie", "N/A")).strip()) or "N/A"
+    curso = db.limpar_campo_usb(str(dados.get("curso", "N/A")).strip()) or "N/A"
+
+    try:
+        hora, gravado = db.registrar_resposta_almoco_db(matricula, nome, serie, curso, vai)
+    except RuntimeError:
+        return jsonify({"erro": "Banco de dados indisponível"}), 503
+
+    db.marcar_ultimo_update_ts()
+    _broadcast_refeitorio()
+    return jsonify({"status": "ok", "refeicao": gravado, "hora": hora}), 200
+
+
 def _total_alunos():
     """Retorna o total de alunos cadastrados para calcular ausências no TV.
 

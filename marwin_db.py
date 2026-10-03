@@ -439,6 +439,41 @@ def ler_refeitorio_periodo_db(data_inicio, data_fim, serie=None, curso=None):
     ]
 
 
+def registrar_resposta_almoco_db(matricula, nome, serie, curso, vai):
+    """Grava na tabela `refeitorio` a resposta "vai almoçar hoje?" do totem.
+
+    A aba Refeitório e o Histórico já tratam refeicao == 'almoco' como
+    "almoçou" e qualquer outra linha como "não almoçou", então:
+      - vai=True  -> linha 'almoco' (e remove um 'sem_almoco' anterior do dia)
+      - vai=False -> linha 'sem_almoco', exceto se o aluno já tem 'almoco'
+                     hoje (uma leitura real no refeitório não é sobrescrita).
+    Idempotente: responder de novo não duplica linhas.
+    Retorna (hora, refeicao_gravada)."""
+    import datetime as _dt
+    data = hoje()
+    hora = _dt.datetime.now().strftime("%H:%M:%S")
+    existentes = executar_pg(
+        "SELECT refeicao FROM refeitorio WHERE data = %s AND matricula = %s AND refeicao IN ('almoco', 'sem_almoco')",
+        (data, matricula), fetch=True,
+    ) or []
+    tem_almoco = any(r["refeicao"] == "almoco" for r in existentes)
+    tem_sem = any(r["refeicao"] == "sem_almoco" for r in existentes)
+
+    if vai:
+        if tem_sem:
+            executar_pg(
+                "DELETE FROM refeitorio WHERE data = %s AND matricula = %s AND refeicao = 'sem_almoco'",
+                (data, matricula),
+            )
+        if not tem_almoco:
+            inserir_refeitorio_db([data, hora, matricula, nome, serie, curso, "almoco"])
+        return hora, "almoco"
+
+    if not tem_almoco and not tem_sem:
+        inserir_refeitorio_db([data, hora, matricula, nome, serie, curso, "sem_almoco"])
+    return hora, ("almoco" if tem_almoco else "sem_almoco")
+
+
 def ler_frequencia_periodo_db(data_inicio, data_fim, serie=None, curso=None):
     """Mesma ideia de ler_refeitorio_periodo_db, para a tabela frequencia."""
     sql = """
